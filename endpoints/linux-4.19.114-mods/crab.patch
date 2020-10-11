@@ -1,0 +1,224 @@
+diff --git a/include/linux/tcp.h b/include/linux/tcp.h
+index 4374196b98ea..a8b1174f66d2 100644
+--- a/include/linux/tcp.h
++++ b/include/linux/tcp.h
+@@ -104,6 +104,7 @@ struct tcp_options_received {
+ 	u8	num_sacks;	/* Number of SACK blocks		*/
+ 	u16	user_mss;	/* mss requested by user in ioctl	*/
+ 	u16	mss_clamp;	/* Maximal mss, negotiated at connection setup */
++	u32	redir_ip;
+ };
+ 
+ static inline void tcp_clear_options(struct tcp_options_received *rx_opt)
+diff --git a/include/net/request_sock.h b/include/net/request_sock.h
+index 1653435f18f5..399c5fea24b0 100644
+--- a/include/net/request_sock.h
++++ b/include/net/request_sock.h
+@@ -67,6 +67,7 @@ struct request_sock {
+ 	u32				*saved_syn;
+ 	u32				secid;
+ 	u32				peer_secid;
++	u32				redir_ip;
+ };
+ 
+ static inline struct request_sock *inet_reqsk(const struct sock *sk)
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index 918bfd0d7d1f..a0c19b58b1a4 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -186,6 +186,7 @@ void tcp_time_wait(struct sock *sk, int state, int timeo);
+ #define TCPOPT_TIMESTAMP	8	/* Better RTT estimations/PAWS */
+ #define TCPOPT_MD5SIG		19	/* MD5 Signature (RFC2385) */
+ #define TCPOPT_FASTOPEN		34	/* Fast open (RFC7413) */
++#define TCPOPT_REDIR	42
+ #define TCPOPT_EXP		254	/* Experimental */
+ /* Magic number to be after the option value for sharing TCP
+  * experimental options. See draft-ietf-tcpm-experimental-options-00.txt
+@@ -205,6 +206,7 @@ void tcp_time_wait(struct sock *sk, int state, int timeo);
+ #define TCPOLEN_FASTOPEN_BASE  2
+ #define TCPOLEN_EXP_FASTOPEN_BASE  4
+ #define TCPOLEN_EXP_SMC_BASE   6
++#define TCPOLEN_REDIR          6
+ 
+ /* But this is what stacks really send out. */
+ #define TCPOLEN_TSTAMP_ALIGNED		12
+@@ -216,6 +218,7 @@ void tcp_time_wait(struct sock *sk, int state, int timeo);
+ #define TCPOLEN_MD5SIG_ALIGNED		20
+ #define TCPOLEN_MSS_ALIGNED		4
+ #define TCPOLEN_EXP_SMC_BASE_ALIGNED	8
++#define TCPOLEN_REDIR_ALIGNED           8
+ 
+ /* Flags in tp->nonagle */
+ #define TCP_NAGLE_OFF		1	/* Nagle's algo is disabled */
+@@ -410,6 +413,7 @@ int tcp_set_rcvlowat(struct sock *sk, int val);
+ void tcp_data_ready(struct sock *sk);
+ int tcp_mmap(struct file *file, struct socket *sock,
+ 	     struct vm_area_struct *vma);
++__be32 tcp_parse_options_for_redir(const struct sk_buff *skb);
+ void tcp_parse_options(const struct net *net, const struct sk_buff *skb,
+ 		       struct tcp_options_received *opt_rx,
+ 		       int estab, struct tcp_fastopen_cookie *foc);
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index 38b6d8f90a44..7d6f59431c40 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -3772,6 +3772,48 @@ static void smc_parse_options(const struct tcphdr *th,
+ #endif
+ }
+ 
++__be32 tcp_parse_options_for_redir(const struct sk_buff *skb)
++{
++	const unsigned char *ptr;
++	const struct tcphdr *th = tcp_hdr(skb);
++	int length = (th->doff * 4) - sizeof(struct tcphdr);
++
++	ptr = (const unsigned char *)(th + 1);
++
++	while (length > 0) {
++		int opcode = *ptr++;
++		int opsize;
++
++		switch (opcode) {
++		case TCPOPT_EOL:
++			goto NOT_FOUNT;
++		case TCPOPT_NOP:	/* Ref: RFC 793 section 3.1 */
++			length--;
++			continue;
++		default:
++			opsize = *ptr++;
++			if (opsize < 2) /* "silly options" */
++				goto NOT_FOUNT;
++			if (opsize > length)
++				goto NOT_FOUNT;	/* don't parse partial options */
++			switch (opcode) {
++			case TCPOPT_REDIR:
++				if (opsize == TCPOLEN_REDIR) {
++					__be32 redir_ip = *((__be32 *)ptr);
++					if (redir_ip)
++						return redir_ip;
++				}
++				break;
++			}
++			ptr += opsize-2;
++			length -= opsize;
++		}
++	}
++NOT_FOUNT:
++	return 0;
++}
++EXPORT_SYMBOL(tcp_parse_options_for_redir);
++
+ /* Look for tcp options. Normally only called on SYN and SYNACK packets.
+  * But, this can also be called on packets in the established flow when
+  * the fast version below fails.
+@@ -3883,7 +3925,13 @@ void tcp_parse_options(const struct net *net,
+ 					smc_parse_options(th, opt_rx, ptr,
+ 							  opsize);
+ 				break;
+-
++			case TCPOPT_REDIR:
++				if (opsize == TCPOLEN_REDIR) {
++					__be32 redir_ip = *((__be32 *)ptr);
++					if (redir_ip)
++						opt_rx->redir_ip = redir_ip;
++				}
++				break;
+ 			}
+ 			ptr += opsize-2;
+ 			length -= opsize;
+@@ -6440,6 +6488,7 @@ int tcp_conn_request(struct request_sock_ops *rsk_ops,
+ 	tcp_rsk(req)->ts_off = 0;
+ 
+ 	tcp_clear_options(&tmp_opt);
++	tmp_opt.redir_ip = 0;
+ 	tmp_opt.mss_clamp = af_ops->mss_clamp;
+ 	tmp_opt.user_mss  = tp->rx_opt.user_mss;
+ 	tcp_parse_options(sock_net(sk), skb, &tmp_opt, 0,
+@@ -6493,6 +6542,10 @@ int tcp_conn_request(struct request_sock_ops *rsk_ops,
+ 
+ 	tcp_ecn_create_request(req, skb, sk, dst);
+ 
++	if (tmp_opt.redir_ip)
++		req->redir_ip = tmp_opt.redir_ip;
++	else
++		req->redir_ip = 0;
+ 	if (want_cookie) {
+ 		isn = cookie_init_sequence(af_ops, sk, skb, &req->mss);
+ 		req->cookie_ts = tmp_opt.tstamp_ok;
+diff --git a/net/ipv4/tcp_ipv4.c b/net/ipv4/tcp_ipv4.c
+index 6da393016c11..8c310a7411ec 100644
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -1583,6 +1583,7 @@ int tcp_v4_early_demux(struct sk_buff *skb)
+ 	const struct iphdr *iph;
+ 	const struct tcphdr *th;
+ 	struct sock *sk;
++	u32 saddr, old_addr=0;
+ 
+ 	if (skb->pkt_type != PACKET_HOST)
+ 		return 0;
+@@ -1596,10 +1597,25 @@ int tcp_v4_early_demux(struct sk_buff *skb)
+ 	if (th->doff < sizeof(struct tcphdr) / 4)
+ 		return 0;
+ 
++	saddr = iph->saddr;
++	/* Check to see if the syn ack is redirected and modify socket */
++	if (th->syn && th->ack) {
++		old_addr = tcp_parse_options_for_redir(skb);
++		if (old_addr)
++			saddr = old_addr;
++	}
+ 	sk = __inet_lookup_established(dev_net(skb->dev), &tcp_hashinfo,
+-				       iph->saddr, th->source,
++				       saddr, th->source,
+ 				       iph->daddr, ntohs(th->dest),
+ 				       skb->skb_iif, inet_sdif(skb));
++
++	/* if redir change the hashes */
++	if (sk && old_addr) {
++		inet_unhash(sk);
++		sk_daddr_set(sk, iph->saddr);
++		inet_sk(sk)->cork.fl.u.ip4.daddr = iph->saddr;
++		inet_hash(sk);
++	}
+ 	if (sk) {
+ 		skb->sk = sk;
+ 		skb->destructor = sock_edemux;
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index cc4ba42052c2..2d534a92822a 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -426,6 +426,7 @@ struct tcp_out_options {
+ 	__u8 *hash_location;	/* temporary pointer, overloaded */
+ 	__u32 tsval, tsecr;	/* need to include OPTION_TS */
+ 	struct tcp_fastopen_cookie *fastopen_cookie;	/* Fast open cookie */
++	u32 redir_ip;
+ };
+ 
+ /* Write previously computed TCP options to the packet.
+@@ -535,6 +536,14 @@ static void tcp_options_write(__be32 *ptr, struct tcp_sock *tp,
+ 		ptr += (len + 3) >> 2;
+ 	}
+ 
++	if (unlikely(opts->redir_ip)) {
++		*ptr++ = htonl((TCPOPT_NOP << 24) |
++			       (TCPOPT_NOP << 16) |
++			       (TCPOPT_REDIR << 8) |
++			       TCPOLEN_REDIR);
++		*ptr++ = opts->redir_ip;
++	}
++
+ 	smc_options_write(ptr, &options);
+ }
+ 
+@@ -699,6 +708,10 @@ static unsigned int tcp_synack_options(const struct sock *sk,
+ 			remaining -= need;
+ 		}
+ 	}
++	if (unlikely(req->redir_ip)) {
++		opts->redir_ip = req->redir_ip;
++		remaining -= TCPOLEN_REDIR_ALIGNED;
++	}
+ 
+ 	smc_set_option_cond(tcp_sk(sk), ireq, opts, &remaining);
+ 

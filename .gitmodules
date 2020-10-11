@@ -1,0 +1,6 @@
+[submodule "middlebox/dpdk/r2p2"]
+	path = middlebox/dpdk/r2p2
+	url = https://github.com/epfl-dcsl/r2p2
+[submodule "middlebox/ebpf/libbpf"]
+	path = middlebox/ebpf/libbpf
+	url = https://github.com/libbpf/libbpf

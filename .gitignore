@@ -1,0 +1,15 @@
+*.o
+*.ll
+*.swp
+*.cmd
+*.mod
+*.mod.c
+*.symvers
+*.ko
+modules.order
+crab
+lbl4-vanilla
+cfg_lbbpl
+lb_cfg
+cfg_lbbps
+xdp_loader
